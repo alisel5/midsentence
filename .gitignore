@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+midsentence.db
+midsentence.db-journal
+.env
+.venv/
+venv/
+.DS_Store
+# Dev-time scratch scripts used during local debugging.
+_*.py

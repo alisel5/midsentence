@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>midsentence</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .mono { font-family: "SF Mono", Monaco, "Cascadia Code", "JetBrains Mono", "Roboto Mono", Consolas, monospace; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #0b0f19; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+    .msg-body.collapsed { max-height: 12rem; overflow: hidden; position: relative; }
+    .msg-body.collapsed::after {
+      content: ""; position: absolute; inset: auto 0 0 0; height: 3rem;
+      background: linear-gradient(to bottom, transparent, rgb(17 24 39));
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden">
+
+  <header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between shrink-0">
+    <div>
+      <h1 class="text-lg font-semibold tracking-tight">midsentence</h1>
+      <p class="text-xs text-gray-500 italic">Your LLM call isn't atomic — it's a conversation paused mid-sentence.</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <div id="upstream-indicator" class="text-[11px] text-gray-500 mono truncate max-w-xs" title=""></div>
+      <div id="status" class="text-xs text-gray-500 mono"></div>
+      <button onclick="toggleSettings()" class="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700">settings</button>
+      <button onclick="refreshCaptures()" class="text-xs px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700">refresh</button>
+      <button onclick="clearCaptures()" class="text-xs px-3 py-1.5 rounded bg-red-950/60 hover:bg-red-900/60 border border-red-900 text-red-300">clear</button>
+    </div>
+  </header>
+
+  <div id="settings-panel" class="hidden border-b border-gray-800 bg-gray-900/60 px-6 py-4 shrink-0">
+    <div class="max-w-2xl space-y-3">
+      <div>
+        <label class="block text-xs text-gray-400 uppercase tracking-widest mb-1">Upstream base URL</label>
+        <input id="settings-upstream" type="url" class="w-full bg-gray-900 border border-gray-800 rounded px-3 py-2 text-sm mono focus:border-blue-600 outline-none" placeholder="https://api.openai.com" />
+        <p class="text-[11px] text-gray-600 mt-1">Any reasonable form works — <code class="mono">https://openrouter.ai/api</code>, <code class="mono">https://openrouter.ai/api/v1</code>, or the full <code class="mono">https://openrouter.ai/api/v1/chat/completions</code>. midsentence fills in whatever's missing.</p>
+      </div>
+      <div>
+        <label class="block text-xs text-gray-400 uppercase tracking-widest mb-1">Debrief API key</label>
+        <input id="settings-key" type="password" autocomplete="off" class="w-full bg-gray-900 border border-gray-800 rounded px-3 py-2 text-sm mono focus:border-blue-600 outline-none" placeholder="sk-... (leave blank to keep existing)" />
+        <p class="text-[11px] text-gray-600 mt-1">Only used by the <strong>ask</strong> button when you debrief a capture. Captured requests use the client's own Authorization header. Status: <span id="settings-key-status" class="mono"></span></p>
+      </div>
+      <div>
+        <label class="flex items-start gap-2 cursor-pointer">
+          <input id="settings-last-thought" type="checkbox" class="mt-1 accent-blue-500" />
+          <div>
+            <span class="block text-xs text-gray-400 uppercase tracking-widest">Capture last-thought (beta)</span>
+            <p class="text-[11px] text-gray-600 mt-1">Injects a system rule that forces the model to emit a one-line <code class="mono">LAST_THOUGHT:</code> before any tool_call or final content. The proxy captures it for debrief anchoring. <strong class="text-amber-500">Mutates outgoing requests</strong> — thought line stays visible in the streamed response. Leave off for pure pass-through.</p>
+          </div>
+        </label>
+      </div>
+      <div class="flex items-center gap-2 pt-1">
+        <button id="settings-save" onclick="saveSettings()" class="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-4 py-2 rounded text-sm font-medium">save</button>
+        <button onclick="toggleSettings(false)" class="px-3 py-2 rounded text-sm text-gray-400 hover:text-gray-200">close</button>
+        <span id="settings-feedback" class="text-xs text-emerald-500 mono"></span>
+      </div>
+    </div>
+  </div>
+
+  <main class="flex-1 flex overflow-hidden">
+
+    <aside class="w-80 border-r border-gray-800 overflow-y-auto shrink-0">
+      <div id="captures-list" class="divide-y divide-gray-800/60"></div>
+    </aside>
+
+    <section class="flex-1 flex flex-col overflow-hidden">
+      <div id="capture-detail" class="flex-1 overflow-y-auto">
+        <div class="text-gray-600 text-sm text-center mt-24 px-8">
+          <div class="mono text-xs mb-4 text-gray-700">waiting for captures…</div>
+          <p>Point your app's LLM base URL at <code class="mono text-xs bg-gray-900 px-1.5 py-0.5 rounded text-gray-400">http://localhost:8765/v1</code> and fire a request.</p>
+          <p class="mt-2 text-gray-700 mono text-xs">OpenAI-compatible chat/completions only. Non-streaming.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    const API = '';
+    let currentCaptureId = null;
+    let captures = [];
+    let settings = { upstream: '', debrief_key_set: false };
+
+    async function clearCaptures() {
+      if (captures.length === 0) return;
+      if (!confirm(`Delete all ${captures.length} captures and their debriefs? This cannot be undone.`)) return;
+      try {
+        const resp = await fetch(API + '/api/captures', { method: 'DELETE' });
+        if (!resp.ok) {
+          alert('error clearing: ' + await resp.text());
+          return;
+        }
+        currentCaptureId = null;
+        document.getElementById('capture-detail').innerHTML = `
+          <div class="text-gray-600 text-sm text-center mt-24 px-8">
+            <div class="mono text-xs mb-4 text-gray-700">cleared — waiting for new captures…</div>
+          </div>`;
+        await refreshCaptures();
+      } catch (e) {
+        alert('error: ' + e.message);
+      }
+    }
+
+    async function refreshCaptures() {
+      try {
+        const resp = await fetch(API + '/api/captures');
+        captures = await resp.json();
+        renderCapturesList();
+        const s = document.getElementById('status');
+        s.textContent = `${captures.length} capture${captures.length === 1 ? '' : 's'}`;
+      } catch (e) {
+        document.getElementById('status').textContent = 'proxy offline';
+      }
+    }
+
+    async function loadSettings() {
+      try {
+        const resp = await fetch(API + '/api/settings');
+        settings = await resp.json();
+        const upstream = settings.upstream || '';
+        const ind = document.getElementById('upstream-indicator');
+        const keyOk = settings.debrief_key_set;
+        const thoughtOn = !!settings.capture_last_thought;
+        ind.textContent = upstream + (thoughtOn ? '  ·  thought:on' : '');
+        ind.title = `upstream: ${upstream}\ndebrief key: ${keyOk ? 'set' : 'NOT set'}\nlast-thought capture: ${thoughtOn ? 'ON' : 'off'}`;
+        ind.classList.toggle('text-amber-500', !keyOk);
+        ind.classList.toggle('text-gray-500', keyOk);
+        // Populate inputs (but don't overwrite a key-in-progress value)
+        const upIn = document.getElementById('settings-upstream');
+        if (upIn && document.activeElement !== upIn) upIn.value = upstream;
+        const ks = document.getElementById('settings-key-status');
+        if (ks) {
+          ks.textContent = keyOk ? 'set' : 'not set';
+          ks.className = 'mono ' + (keyOk ? 'text-emerald-500' : 'text-amber-500');
+        }
+        const lt = document.getElementById('settings-last-thought');
+        if (lt && document.activeElement !== lt) lt.checked = thoughtOn;
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    function toggleSettings(force) {
+      const panel = document.getElementById('settings-panel');
+      const shouldShow = typeof force === 'boolean' ? force : panel.classList.contains('hidden');
+      panel.classList.toggle('hidden', !shouldShow);
+      if (shouldShow) {
+        loadSettings().then(() => {
+          const upIn = document.getElementById('settings-upstream');
+          upIn && upIn.focus();
+        });
+      }
+    }
+
+    async function saveSettings() {
+      const btn = document.getElementById('settings-save');
+      const feedback = document.getElementById('settings-feedback');
+      const upstream = document.getElementById('settings-upstream').value.trim();
+      const keyInput = document.getElementById('settings-key');
+      const keyVal = keyInput.value; // do NOT trim — some keys legitimately have whitespace at boundaries? no, still trim
+      const lt = document.getElementById('settings-last-thought');
+      const payload = { upstream, capture_last_thought: !!(lt && lt.checked) };
+      // Only send the key if user typed one in this session — blank = keep existing
+      if (keyVal.trim() !== '') payload.debrief_api_key = keyVal.trim();
+      btn.disabled = true; btn.textContent = 'saving…';
+      feedback.textContent = '';
+      try {
+        const resp = await fetch(API + '/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          feedback.textContent = 'error: ' + t;
+          feedback.className = 'text-xs text-red-400 mono';
+          return;
+        }
+        settings = await resp.json();
+        keyInput.value = '';
+        feedback.textContent = 'saved — next request uses new config';
+        feedback.className = 'text-xs text-emerald-500 mono';
+        await loadSettings();
+        setTimeout(() => { feedback.textContent = ''; }, 2500);
+      } catch (e) {
+        feedback.textContent = 'error: ' + e.message;
+        feedback.className = 'text-xs text-red-400 mono';
+      } finally {
+        btn.disabled = false; btn.textContent = 'save';
+      }
+    }
+
+    function renderCapturesList() {
+      const list = document.getElementById('captures-list');
+      list.innerHTML = '';
+      if (captures.length === 0) {
+        list.innerHTML = `
+          <div class="p-6 text-gray-600 text-xs">
+            <div class="text-gray-500 text-sm mb-2">No captures yet.</div>
+            Make a chat/completions call against
+            <code class="mono bg-gray-900 px-1 py-0.5 rounded text-gray-400 text-xs">http://localhost:8765/v1</code>
+            and it will appear here.
+          </div>`;
+        return;
+      }
+      for (const c of captures) {
+        const el = document.createElement('div');
+        const active = c.id === currentCaptureId;
+        el.className = `px-3 py-2.5 cursor-pointer text-sm transition ${active ? 'bg-gray-800' : 'hover:bg-gray-900'}`;
+        el.onclick = () => selectCapture(c.id);
+        const dt = new Date(c.created_at * 1000);
+        const time = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const statusColor =
+          c.response_status === 200 ? 'text-emerald-500' :
+          !c.response_status ? 'text-gray-500' : 'text-red-500';
+        const thoughtBadge = c.last_thought
+          ? `<div class="text-[11px] text-amber-300/80 italic truncate mt-1" title="${escapeHtml(c.last_thought)}">💭 ${escapeHtml(c.last_thought)}</div>`
+          : '';
+        el.innerHTML = `
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <span class="mono text-xs text-gray-500">${time}</span>
+            <span class="mono text-xs ${statusColor}">${c.response_status || 'err'}</span>
+          </div>
+          <div class="text-gray-200 truncate leading-tight">${escapeHtml(c.preview) || '<span class="text-gray-600">(no user message)</span>'}</div>
+          ${thoughtBadge}
+          <div class="mono text-[10px] text-gray-600 mt-1 flex items-center gap-2">
+            <span>${escapeHtml(c.model || '?')}</span>
+            <span>·</span>
+            <span>${c.latency_ms}ms</span>
+            <span>·</span>
+            <span>${c.num_messages}m ${c.num_tools}t</span>
+          </div>`;
+        list.appendChild(el);
+      }
+    }
+
+    async function selectCapture(id) {
+      currentCaptureId = id;
+      renderCapturesList(); // update highlight
+      const detail = document.getElementById('capture-detail');
+      detail.innerHTML = `<div class="p-8 text-gray-500 text-sm mono">loading ${id}…</div>`;
+      try {
+        const resp = await fetch(API + '/api/captures/' + id);
+        if (!resp.ok) {
+          detail.innerHTML = `<div class="p-8 text-red-400 text-sm">error: ${resp.status}</div>`;
+          return;
+        }
+        const c = await resp.json();
+        renderCaptureDetail(c);
+      } catch (e) {
+        detail.innerHTML = `<div class="p-8 text-red-400 text-sm">error: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    function renderCaptureDetail(c) {
+      const detail = document.getElementById('capture-detail');
+      const req = c.request_body || {};
+      const res = c.response_body || {};
+      const asstMsg = res.choices?.[0]?.message || {};
+      const finishReason = res.choices?.[0]?.finish_reason || '';
+
+      let html = `
+        <div class="px-6 py-4 border-b border-gray-800 bg-gray-950 sticky top-0 z-10">
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <div class="mono text-xs text-gray-500">${escapeHtml(c.id)}</div>
+              <div class="flex items-center gap-3 mt-1">
+                <span class="mono text-sm text-gray-200">${escapeHtml(c.model || '?')}</span>
+                <span class="text-xs text-gray-600">·</span>
+                <span class="mono text-xs text-gray-500">${c.latency_ms}ms</span>
+                <span class="text-xs text-gray-600">·</span>
+                <span class="mono text-xs ${c.response_status === 200 ? 'text-emerald-500' : 'text-red-500'}">${c.response_status || 'err'}</span>
+                ${finishReason ? `<span class="text-xs text-gray-600">·</span><span class="mono text-xs text-gray-500">finish: ${escapeHtml(finishReason)}</span>` : ''}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="p-6 space-y-6">
+      `;
+
+      // Request messages
+      html += `
+        <section>
+          <h3 class="text-[10px] font-semibold text-gray-500 mb-3 uppercase tracking-widest">Request · messages</h3>
+          <div class="space-y-2">
+      `;
+      for (const m of (req.messages || [])) {
+        html += renderMessage(m);
+      }
+      html += `</div>`;
+
+      if (req.tools && req.tools.length) {
+        html += `
+          <div class="mt-3 text-xs">
+            <span class="text-gray-500">tools[${req.tools.length}]:</span>
+            <span class="mono text-gray-400 ml-1">${req.tools.map(t => escapeHtml(t.function?.name || '?')).join(', ')}</span>
+          </div>`;
+      }
+      html += `</section>`;
+
+      // Response
+      html += `
+        <section>
+          <h3 class="text-[10px] font-semibold text-gray-500 mb-3 uppercase tracking-widest">Response · assistant</h3>`;
+      if (c.last_thought) {
+        html += `
+          <div class="mb-3 border border-amber-900/60 rounded bg-amber-950/30 p-3">
+            <div class="flex items-center justify-between gap-2 mb-1.5">
+              <div class="mono text-[10px] text-amber-400 uppercase tracking-widest">💭 last thought</div>
+              <button onclick="traceThought()" class="text-[10px] mono text-amber-300 hover:text-amber-200 px-2 py-0.5 rounded border border-amber-900/60 bg-amber-950/40">trace this →</button>
+            </div>
+            <div class="text-sm text-amber-100 italic">${escapeHtml(c.last_thought)}</div>
+          </div>`;
+      }
+      html += `<div class="space-y-2">`;
+      if (asstMsg.content) {
+        html += renderMessage({ role: 'assistant', content: asstMsg.content });
+      }
+      for (const tc of (asstMsg.tool_calls || [])) {
+        html += `
+          <div class="border border-purple-900/60 rounded bg-purple-950/30 p-3">
+            <div class="mono text-[10px] text-purple-400 uppercase tracking-widest mb-1.5">
+              tool_call → ${escapeHtml(tc.function?.name || '?')}
+            </div>
+            <pre class="mono text-xs text-gray-300 whitespace-pre-wrap break-all">${escapeHtml(prettyJson(tc.function?.arguments))}</pre>
+          </div>`;
+      }
+      if (!asstMsg.content && !(asstMsg.tool_calls || []).length) {
+        html += `<div class="text-gray-600 text-xs italic">(empty response)</div>`;
+      }
+      html += `</div></section>`;
+
+      // Debrief
+      html += `
+        <section class="pt-2">
+          <h3 class="text-[10px] font-semibold text-gray-500 mb-3 uppercase tracking-widest">Debrief</h3>
+          <p class="text-xs text-gray-500 mb-3">
+            Ask the same model why it did what it did. Nothing here affects production.
+          </p>
+          <div id="debrief-thread" class="space-y-2 mb-3">
+      `;
+      for (const d of (c.debriefs || [])) {
+        html += `
+          <div class="border border-blue-900/60 rounded bg-blue-950/30 p-3">
+            <div class="mono text-[10px] text-blue-400 uppercase tracking-widest mb-1.5">you</div>
+            <div class="text-sm text-gray-200 whitespace-pre-wrap">${escapeHtml(d.question)}</div>
+          </div>
+          <div class="border border-gray-800 rounded bg-gray-900/60 p-3">
+            <div class="mono text-[10px] text-gray-400 uppercase tracking-widest mb-1.5">${escapeHtml(c.model || 'model')}</div>
+            <div class="text-sm text-gray-200 whitespace-pre-wrap">${escapeHtml(d.answer || '(empty)')}</div>
+          </div>`;
+      }
+      html += `</div>
+          <div class="flex gap-2">
+            <textarea id="debrief-input" rows="2" placeholder="why did you pick tool X over tool Y? which prompt lines steered it?"
+              class="flex-1 bg-gray-900 border border-gray-800 rounded px-3 py-2 text-sm focus:border-blue-600 outline-none resize-none font-normal"></textarea>
+            <button id="debrief-send" onclick="sendDebrief()"
+              class="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed px-4 rounded text-sm font-medium transition min-w-20">
+              ask
+            </button>
+          </div>
+        </section>
+      </div>
+      `;
+
+      detail.innerHTML = html;
+      // Auto-collapse long messages
+      document.querySelectorAll('.msg-body').forEach(el => {
+        if (el.scrollHeight > 260) {
+          el.classList.add('collapsed');
+          const toggle = document.createElement('button');
+          toggle.textContent = 'expand';
+          toggle.className = 'text-[10px] mono text-blue-400 hover:text-blue-300 mt-2 px-2 py-0.5 rounded border border-blue-900/60 bg-blue-950/30';
+          toggle.onclick = () => {
+            const collapsed = el.classList.toggle('collapsed');
+            toggle.textContent = collapsed ? 'expand' : 'collapse';
+          };
+          el.parentElement.appendChild(toggle);
+        }
+      });
+
+      // Enter-to-send on debrief input (Cmd/Ctrl+Enter)
+      const input = document.getElementById('debrief-input');
+      if (input) {
+        input.addEventListener('keydown', (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            sendDebrief();
+          }
+        });
+      }
+    }
+
+    function renderMessage(m) {
+      const roleColor = {
+        system: 'text-amber-400',
+        user: 'text-sky-400',
+        assistant: 'text-emerald-400',
+        tool: 'text-purple-400',
+      }[m.role] || 'text-gray-400';
+      let content = m.content;
+      if (Array.isArray(content)) {
+        content = content.map(p => (typeof p === 'string' ? p : p.text || '')).join('\n');
+      }
+      if (content === null || content === undefined) content = '';
+      // Show tool_calls inline for assistant
+      let extra = '';
+      if (m.tool_calls && m.tool_calls.length) {
+        extra = m.tool_calls.map(tc => `\n[tool_call → ${tc.function?.name}] ${tc.function?.arguments || ''}`).join('\n');
+      }
+      const full = (content + extra).trim() || '(empty)';
+      const toolIdBadge = m.tool_call_id ? `<span class="text-[10px] text-gray-600 mono">→ ${escapeHtml(m.tool_call_id)}</span>` : '';
+      return `
+        <div class="border border-gray-800 rounded bg-gray-900/40">
+          <div class="px-3 pt-2 flex items-center justify-between">
+            <span class="mono text-[10px] ${roleColor} uppercase tracking-widest">${m.role}</span>
+            ${toolIdBadge}
+          </div>
+          <div class="msg-body px-3 pb-3 pt-1 text-xs text-gray-300 whitespace-pre-wrap break-words mono">${escapeHtml(full)}</div>
+        </div>`;
+    }
+
+    function traceThought() {
+      const cap = captures.find(c => c.id === currentCaptureId);
+      if (!cap || !cap.last_thought) return;
+      const input = document.getElementById('debrief-input');
+      if (!input) return;
+      input.value =
+        `Your last thought before this round's action was:\n"${cap.last_thought}"\n\n` +
+        `Trace that thought back: which system-prompt lines, user messages, or tool_results produced it? ` +
+        `Quote verbatim. If the thought came from training priors rather than prompt content, ` +
+        `output NO_SUPPORTING_LINE for that element — silence is the finding.`;
+      input.focus();
+      input.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    async function sendDebrief() {
+      if (!currentCaptureId) return;
+      const input = document.getElementById('debrief-input');
+      const thread = document.getElementById('debrief-thread');
+      const question = (input.value || '').trim();
+      if (!question || !thread) return;
+
+      // Grab the capture's model name from the header, so the pending bubble
+      // can label itself with the same model tag the final reply will use.
+      const modelFromHeader = (captures.find(c => c.id === currentCaptureId) || {}).model || 'model';
+      const modelLabel = escapeHtml(modelFromHeader);
+      const placeholderId = 'debrief-pending-' + Date.now();
+
+      // Optimistic append: user question + thinking placeholder bubble.
+      // Button stays enabled so multi-turn follow-ups can queue naturally.
+      thread.insertAdjacentHTML('beforeend', `
+        <div class="border border-blue-900/60 rounded bg-blue-950/30 p-3">
+          <div class="mono text-[10px] text-blue-400 uppercase tracking-widest mb-1.5">you</div>
+          <div class="text-sm text-gray-200 whitespace-pre-wrap">${escapeHtml(question)}</div>
+        </div>
+        <div id="${placeholderId}" class="border border-gray-800 rounded bg-gray-900/60 p-3">
+          <div class="mono text-[10px] text-gray-400 uppercase tracking-widest mb-1.5 flex items-center gap-2">
+            <span>${modelLabel}</span>
+            <span class="inline-flex gap-1" aria-label="thinking">
+              <span class="w-1 h-1 bg-gray-400 rounded-full animate-pulse" style="animation-delay:0ms"></span>
+              <span class="w-1 h-1 bg-gray-400 rounded-full animate-pulse" style="animation-delay:200ms"></span>
+              <span class="w-1 h-1 bg-gray-400 rounded-full animate-pulse" style="animation-delay:400ms"></span>
+            </span>
+          </div>
+          <div class="text-sm text-gray-500 italic">thinking…</div>
+        </div>
+      `);
+
+      input.value = '';
+      input.focus();
+      const placeholder = document.getElementById(placeholderId);
+      if (placeholder) placeholder.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+      try {
+        const resp = await fetch(`${API}/api/captures/${currentCaptureId}/debrief`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question }),
+        });
+        const ph = document.getElementById(placeholderId);
+        if (!resp.ok) {
+          const text = await resp.text();
+          if (ph) {
+            ph.className = 'border border-red-900/60 rounded bg-red-950/30 p-3';
+            ph.innerHTML = `
+              <div class="mono text-[10px] text-red-400 uppercase tracking-widest mb-1.5">error</div>
+              <div class="text-sm text-red-300 whitespace-pre-wrap">${escapeHtml(text)}</div>`;
+          }
+          return;
+        }
+        const data = await resp.json();
+        if (ph) {
+          ph.className = 'border border-gray-800 rounded bg-gray-900/60 p-3';
+          ph.innerHTML = `
+            <div class="mono text-[10px] text-gray-400 uppercase tracking-widest mb-1.5">${modelLabel}</div>
+            <div class="text-sm text-gray-200 whitespace-pre-wrap">${escapeHtml(data.answer || '(empty)')}</div>`;
+          ph.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+      } catch (e) {
+        const ph = document.getElementById(placeholderId);
+        if (ph) {
+          ph.className = 'border border-red-900/60 rounded bg-red-950/30 p-3';
+          ph.innerHTML = `
+            <div class="mono text-[10px] text-red-400 uppercase tracking-widest mb-1.5">error</div>
+            <div class="text-sm text-red-300">${escapeHtml(e.message)}</div>`;
+        }
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function prettyJson(s) {
+      try { return JSON.stringify(JSON.parse(s), null, 2); }
+      catch { return s || ''; }
+    }
+
+    refreshCaptures();
+    loadSettings();
+    setInterval(refreshCaptures, 5000);
+    setInterval(loadSettings, 15000);
+  </script>
+</body>
+</html>
